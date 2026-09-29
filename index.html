@@ -83,25 +83,47 @@ const LOGO_DARK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAhwAAACACAYAAAB
 
 // -------------------- 2. CONSTANTES --------------------
 const SERVICE_LABELS = {
-  presencia: "Presencia",
   contenido: "Contenido",
   foto_video: "Fotografía y Video",
   meta_ads: "Campañas en Meta",
   diseno_grafico: "Diseño Gráfico",
   otro: "Otro",
 };
+// "Presencia" se unificó con "Contenido": los pagos viejos con presencia se muestran como contenido.
+const LEGACY_SERVICE_MAP = { presencia: "contenido" };
+function normService(s) { return LEGACY_SERVICE_MAP[s] || s; }
+// Archivos adjuntos en pagos
+const ALLOWED_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "rtf", "odt", "ods", "md", "json", "xml", "jpg", "jpeg", "png"];
+const ATTACH_ACCEPT = ALLOWED_EXT.map((e) => "." + e).join(",");
+const MAX_FILE_MB = 10;
+const BUCKET = "payment-files";
 const INACTIVE_AFTER_DAYS = 61; // 2 meses sin pagos -> inactivo
 const PALETTE = ["#2BBAD9", "#BB9D82", "#070A0F", "#5DD3EA", "#8E7360", "#9CA3AF"];
 
 // -------------------- 3. UTILIDADES DE MÉTRICAS --------------------
+// Las fechas "YYYY-MM-DD" que vienen de la base se leen como fecha LOCAL.
+// (new Date("2026-09-01") las toma como UTC y en Argentina retrocede al 31/08.)
+function parseLocalDate(v) {
+  if (v instanceof Date) return v;
+  const m = String(v).match(/^(\d{4})-(\d{2})(?:-(\d{2}))?/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3] || 1));
+  return new Date(v);
+}
+function localMonthStr() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
+function localDateStr() { const d = new Date(); return `${localMonthStr()}-${String(d.getDate()).padStart(2, "0")}`; }
+function addMonthsKey(key, n) {
+  const [y, m] = key.split("-").map(Number);
+  const d = new Date(y, m - 1 + n, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
 function monthKey(dateLike) {
-  const d = new Date(dateLike);
+  const d = parseLocalDate(dateLike);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 function computeClientStatus(payments) {
   if (!payments || payments.length === 0) return "sin_pagos";
   const last = payments.reduce((latest, p) => {
-    const d = new Date(p.period_month);
+    const d = parseLocalDate(p.period_month);
     return d > latest ? d : latest;
   }, new Date(0));
   const diffDays = (Date.now() - last.getTime()) / (1000 * 60 * 60 * 24);
@@ -110,7 +132,7 @@ function computeClientStatus(payments) {
 function statusLabel(s) { return { activo: "Activo", inactivo: "Inactivo", sin_pagos: "Sin pagos" }[s] || s; }
 function totalSpent(payments) { return (payments || []).reduce((s, p) => s + Number(p.amount || 0), 0); }
 function monthsWorkingTogether(startDate) {
-  const start = new Date(startDate), now = new Date();
+  const start = parseLocalDate(startDate), now = new Date();
   let months = (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth());
   if (now.getDate() < start.getDate()) months -= 1;
   return Math.max(0, months);
@@ -133,12 +155,22 @@ function groupPaymentsByMonth(payments) {
 }
 function groupPaymentsByYear(payments) {
   const map = {};
-  for (const p of payments || []) { const y = new Date(p.period_month).getFullYear(); map[y] = (map[y] || 0) + Number(p.amount || 0); }
+  for (const p of payments || []) { const y = parseLocalDate(p.period_month).getFullYear(); map[y] = (map[y] || 0) + Number(p.amount || 0); }
   return map;
+}
+// Un pago puede tener varios servicios (p.services). Los pagos viejos usan p.service.
+function paymentServices(p) {
+  let list = Array.isArray(p.services) && p.services.length ? p.services : [p.service];
+  list = list.filter(Boolean).map(normService);
+  return [...new Set(list)];
 }
 function groupPaymentsByService(payments) {
   const map = {};
-  for (const p of payments || []) { map[p.service] = (map[p.service] || 0) + Number(p.amount || 0); }
+  for (const p of payments || []) {
+    const svcs = paymentServices(p);
+    const share = Number(p.amount || 0) / (svcs.length || 1); // el monto se reparte en partes iguales
+    for (const sv of svcs) map[sv] = (map[sv] || 0) + share;
+  }
   return map;
 }
 function lastNMonthKeys(n) {
@@ -277,7 +309,8 @@ function compareMetrics(current, previous) {
   return comparison.sort((a, b) => (b.current || 0) - (a.current || 0));
 }
 function buildLocalSummary(comparison, opts = {}) {
-  const { clientName, periodLabel } = opts;
+  const { clientName, periodLabel, baseLabel } = opts;
+  const ref = baseLabel || "el período anterior";
   if (!comparison || comparison.length === 0) return "No se detectaron métricas numéricas en el archivo cargado.";
   const withChange = comparison.filter((c) => c.changePct !== null);
   const improved = withChange.filter((c) => c.changePct > 0).sort((a, b) => b.changePct - a.changePct);
@@ -285,8 +318,8 @@ function buildLocalSummary(comparison, opts = {}) {
   const lines = [];
   const who = clientName ? `de ${clientName}` : "generales";
   lines.push(`Resumen del rendimiento ${who}${periodLabel ? ` — ${periodLabel}` : ""}.`);
-  if (improved.length > 0) { const top = improved[0]; lines.push(`El indicador que más mejoró fue "${top.label}", con un incremento del ${top.changePct}% respecto al período anterior.`); }
-  if (worsened.length > 0) { const worst = worsened[0]; lines.push(`El indicador con mayor caída fue "${worst.label}", con una baja del ${Math.abs(worst.changePct)}%.`); }
+  if (improved.length > 0) { const top = improved[0]; lines.push(`El indicador que más mejoró fue "${top.label}", con un incremento del ${top.changePct}% en comparación con ${ref}.`); }
+  if (worsened.length > 0) { const worst = worsened[0]; lines.push(`El indicador con mayor caída fue "${worst.label}", con una baja del ${Math.abs(worst.changePct)}% en comparación con ${ref}.`); }
   if (withChange.length === 0) { lines.push("Es el primer período con datos cargados, todavía no hay una comparación histórica."); }
   else {
     const promedio = withChange.reduce((s, c) => s + c.changePct, 0) / withChange.length;
@@ -492,7 +525,7 @@ async function viewDashboard() {
     <div class="card">
       <h3 style="font-family:'Sora';font-weight:800;font-size:15px;">Cargar inversión / gastos del mes</h3>
       <form onsubmit="return saveFinance(event)" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;">
-        <div><label class="field-label">Mes</label><input type="month" id="financeMonth" value="${new Date().toISOString().slice(0, 7)}" required></div>
+        <div><label class="field-label">Mes</label><input type="month" id="financeMonth" value="${localMonthStr()}" required></div>
         <div><label class="field-label">Inversión</label><input type="number" id="financeInvestment" placeholder="0" style="width:140px;"></div>
         <div><label class="field-label">Gastos operativos</label><input type="number" id="financeExpenses" placeholder="0" style="width:140px;"></div>
         <button class="btn btn-primary">Guardar</button>
@@ -589,7 +622,7 @@ function viewClienteNuevo() {
       <label class="field-label">Contacto (WhatsApp, email...)</label>
       <input id="ncContact" style="width:100%;margin-bottom:12px;">
       <label class="field-label">Trabajando juntos desde *</label>
-      <input id="ncStart" type="date" required value="${new Date().toISOString().slice(0, 10)}" style="width:100%;margin-bottom:12px;">
+      <input id="ncStart" type="date" required value="${localDateStr()}" style="width:100%;margin-bottom:12px;">
       <label class="field-label">Notas</label>
       <textarea id="ncNotes" rows="3" style="width:100%;margin-bottom:12px;"></textarea>
       <p id="ncError" style="color:#dc2626;font-size:13px;"></p>
@@ -621,6 +654,47 @@ async function viewClienteDetalle(id) {
   window.__currentClient = { client, payments: payments || [], reports: reports || [] };
   renderClienteDetalle();
 }
+function serviceChecksHtml(prefix, selected) {
+  const sel = new Set((selected || []).map(normService));
+  return Object.entries(SERVICE_LABELS).map(([v, l]) =>
+    `<label style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:1px solid rgba(7,10,15,.15);border-radius:999px;font-size:13px;cursor:pointer;margin:0 6px 6px 0;background:#fff;"><input type="checkbox" name="${prefix}Service" value="${v}" ${sel.has(v) ? "checked" : ""}> ${l}</label>`).join("");
+}
+function getCheckedServices(prefix) { return [...document.querySelectorAll(`input[name="${prefix}Service"]:checked`)].map((i) => i.value); }
+function fileIcon(name) {
+  const e = String(name).split(".").pop().toLowerCase();
+  if (["jpg", "jpeg", "png"].includes(e)) return "🖼️";
+  if (e === "pdf") return "📕";
+  if (["xls", "xlsx", "csv", "ods"].includes(e)) return "📊";
+  if (["doc", "docx", "odt", "rtf"].includes(e)) return "📝";
+  return "📄";
+}
+function safeFileName(name) { return String(name).normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^A-Za-z0-9._-]+/g, "_"); }
+function getAtt(p) { return Array.isArray(p.attachments) ? p.attachments : []; }
+
+async function uploadPaymentFiles(clientId, paymentId, fileList) {
+  const ok = [], failed = [];
+  let i = 0;
+  for (const f of fileList) {
+    const ext = f.name.split(".").pop().toLowerCase();
+    if (!ALLOWED_EXT.includes(ext)) { failed.push(`${f.name}: formato no permitido`); continue; }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) { failed.push(`${f.name}: supera ${MAX_FILE_MB} MB`); continue; }
+    const path = `${clientId}/${paymentId}/${Date.now()}-${i++}-${safeFileName(f.name)}`;
+    const { error } = await sb.storage.from(BUCKET).upload(path, f, { contentType: f.type || undefined, upsert: false });
+    if (error) { failed.push(`${f.name}: ${error.message}`); continue; }
+    ok.push({ path, name: f.name, size: f.size, type: f.type || ext });
+  }
+  return { ok, failed };
+}
+async function openAttachment(paymentId, idx) {
+  const p = window.__currentClient.payments.find((x) => String(x.id) === String(paymentId));
+  const a = p && getAtt(p)[idx];
+  if (!a) return;
+  const w = window.open("", "_blank");
+  const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(a.path, 300);
+  if (error || !data) { if (w) w.close(); alert("No se pudo abrir el archivo: " + (error?.message || "")); return; }
+  if (w) w.location.href = data.signedUrl; else window.location.href = data.signedUrl;
+}
+
 function renderClienteDetalle() {
   const { client, payments, reports } = window.__currentClient;
   const status = computeClientStatus(payments);
@@ -630,7 +704,20 @@ function renderClienteDetalle() {
   const last6 = lastNMonthKeys(6);
   const revLabels = last6.map(monthKeyLabel);
   const revValues = last6.map((m) => byMonth[m] || 0);
-  const serviceOptions = Object.entries(SERVICE_LABELS).map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+  const baseline = reports.find((r) => r.kind === "previo");
+  const monthly = reports.filter((r) => r.kind !== "previo");
+  const reportCard = (r, tag) => `
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
+          <div>
+            <p style="font-weight:700;margin:0;">${tag ? '<span class="badge badge-activo" style="margin-right:6px;">Antes de iniciar</span>' : ""}${tag ? "" : monthKeyLabel(r.period_month)}</p>
+            <p style="font-size:12px;color:rgba(7,10,15,.5);margin:2px 0 0;">${escapeHtml(r.source_name || "")} · ${escapeHtml(r.source_type || "")}</p>
+          </div>
+          <button style="background:none;border:none;color:#dc2626;cursor:pointer;font-size:13px;" onclick="deleteReport('${r.id}')">Eliminar</button>
+        </div>
+        ${r.summary ? `<p style="font-size:14px;color:rgba(7,10,15,.7);margin-top:8px;">${escapeHtml(r.summary)}</p>` : ""}
+        ${r.metrics && Object.keys(r.metrics).length ? `<div style="margin-top:10px;">${Object.values(r.metrics).slice(0, 8).map((m) => `<span class="chip">${escapeHtml(m.label)}: <b>${m.total}</b></span>`).join("")}</div>` : ""}
+      </div>`;
 
   app.innerHTML = `
   ${navHtml("clientes")}
@@ -641,7 +728,7 @@ function renderClienteDetalle() {
           <h1 class="page-title" style="margin:0;">${escapeHtml(client.name)}</h1>
           <span class="badge badge-${status}">${statusLabel(status)}</span>
         </div>
-        <p style="color:rgba(7,10,15,.6);font-size:14px;margin:4px 0 0;">Trabajando juntos hace ${formatMonthsLabel(months)} · Desde ${new Date(client.start_date).toLocaleDateString("es-AR")}</p>
+        <p style="color:rgba(7,10,15,.6);font-size:14px;margin:4px 0 0;">Trabajando juntos hace ${formatMonthsLabel(months)} · Desde ${parseLocalDate(client.start_date).toLocaleDateString("es-AR")}</p>
         ${client.contact ? `<p style="color:rgba(7,10,15,.6);font-size:14px;">Contacto: ${escapeHtml(client.contact)}</p>` : ""}
       </div>
       <div style="display:flex;gap:10px;align-items:center;">
@@ -660,12 +747,17 @@ function renderClienteDetalle() {
 
     <div class="card">
       <h3 style="font-family:'Sora';font-weight:800;font-size:15px;">Registrar pago</h3>
-      <form onsubmit="return registerPayment(event)" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;align-items:end;">
-        <div><label class="field-label">Monto</label><input type="number" id="payAmount" required placeholder="$"></div>
-        <div><label class="field-label">Mes</label><input type="month" id="payMonth" required value="${new Date().toISOString().slice(0, 7)}"></div>
-        <div><label class="field-label">Servicio contratado</label><select id="payService">${serviceOptions}</select></div>
-        <div><label class="field-label">Detalle (opcional)</label><input id="payDetail" placeholder="Ej: combo Growth"></div>
-        <button class="btn btn-primary">Registrar</button>
+      <form onsubmit="return registerPayment(event)">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;align-items:end;">
+          <div><label class="field-label">Monto</label><input type="number" id="payAmount" required placeholder="$" style="width:100%;"></div>
+          <div><label class="field-label">Mes</label><input type="month" id="payMonth" required value="${localMonthStr()}" style="width:100%;"></div>
+          <div><label class="field-label">Detalle (opcional)</label><input id="payDetail" placeholder="Ej: combo Growth" style="width:100%;"></div>
+        </div>
+        <label class="field-label" style="margin-top:12px;">Servicios incluidos en este pago (podés marcar más de uno)</label>
+        <div>${serviceChecksHtml("pay", [])}</div>
+        <label class="field-label" style="margin-top:6px;">Comprobantes / archivos (opcional · PDF, Word, Excel, texto, JPG, PNG · hasta ${MAX_FILE_MB} MB c/u)</label>
+        <input type="file" id="payFiles" multiple accept="${ATTACH_ACCEPT}" style="width:100%;margin-bottom:12px;">
+        <button class="btn btn-primary" id="payBtn">Registrar</button>
       </form>
       <p id="payMsg" style="font-size:13px;color:rgba(7,10,15,.6);margin-top:8px;"></p>
     </div>
@@ -673,42 +765,152 @@ function renderClienteDetalle() {
     <div class="card" style="padding:0;overflow:hidden;">
       <h3 style="font-family:'Sora';font-weight:800;font-size:15px;padding:18px 18px 0;">Historial de pagos</h3>
       ${payments.length === 0 ? '<p style="padding:18px;color:rgba(7,10,15,.5);">Todavía no hay pagos registrados.</p>' : `
+      <div style="overflow-x:auto;">
       <table style="margin-top:10px;">
-        <thead><tr><th>Mes</th><th>Servicio</th><th>Detalle</th><th>Monto</th></tr></thead>
-        <tbody>${payments.map((p) => `<tr><td>${monthKeyLabel(p.period_month)}</td><td>${SERVICE_LABELS[p.service] || p.service}</td><td style="color:rgba(7,10,15,.6);">${escapeHtml(p.service_detail || "—")}</td><td style="font-weight:600;">${formatCurrency(p.amount)}</td></tr>`).join("")}</tbody>
-      </table>`}
+        <thead><tr><th>Mes</th><th>Servicios</th><th>Detalle</th><th>Archivos</th><th>Monto</th><th></th></tr></thead>
+        <tbody>${payments.map((p) => `<tr>
+          <td style="white-space:nowrap;">${monthKeyLabel(p.period_month)}</td>
+          <td>${paymentServices(p).map((sv) => `<span class="chip">${SERVICE_LABELS[sv] || escapeHtml(sv)}</span>`).join("")}</td>
+          <td style="color:rgba(7,10,15,.6);">${escapeHtml(p.service_detail || "—")}</td>
+          <td>${getAtt(p).length ? getAtt(p).map((a, i) => `<a href="#" class="chip" style="text-decoration:none;" onclick="openAttachment('${p.id}',${i});return false;">${fileIcon(a.name)} ${escapeHtml(a.name)}</a>`).join("") : '<span style="color:rgba(7,10,15,.35);">—</span>'}</td>
+          <td style="font-weight:600;white-space:nowrap;">${formatCurrency(p.amount)}</td>
+          <td style="white-space:nowrap;text-align:right;">
+            <button class="btn btn-sm" style="background:rgba(7,10,15,.06);" onclick="openPaymentEdit('${p.id}')">Editar</button>
+            <button class="btn btn-sm" style="background:rgba(220,38,38,.1);color:#b91c1c;" onclick="deletePayment('${p.id}')">Quitar</button>
+          </td>
+        </tr>`).join("")}</tbody>
+      </table></div>`}
     </div>
 
     <div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0 10px;">
       <h2 style="font-family:'Sora';font-weight:800;font-size:18px;margin:0;">Informes de rendimiento</h2>
       <button class="btn btn-primary" onclick="openUploadModal()">+ Cargar informe</button>
     </div>
-    ${reports.length === 0 ? '<p class="card">Todavía no se cargaron informes de rendimiento para este cliente.</p>' : reports.map((r) => `
-      <div class="card">
-        <p style="font-weight:700;margin:0;">${monthKeyLabel(r.period_month)}</p>
-        <p style="font-size:12px;color:rgba(7,10,15,.5);margin:2px 0 0;">${escapeHtml(r.source_name || "")} · ${escapeHtml(r.source_type || "")}</p>
-        ${r.summary ? `<p style="font-size:14px;color:rgba(7,10,15,.7);margin-top:8px;">${escapeHtml(r.summary)}</p>` : ""}
-        ${r.metrics && Object.keys(r.metrics).length ? `<div style="margin-top:10px;">${Object.values(r.metrics).slice(0, 8).map((m) => `<span class="chip">${escapeHtml(m.label)}: <b>${m.total}</b></span>`).join("")}</div>` : ""}
-      </div>
-    `).join("")}
+    <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--arena);margin:14px 0 8px;">Antes de iniciar con Muta</h3>
+    ${baseline ? reportCard(baseline, true) : '<p class="card" style="color:rgba(7,10,15,.6);">Todavía no se cargó el informe previo. Cargalo con “+ Cargar informe” → “Informe previo”, así podés comparar contra cómo estaba el cliente antes de arrancar.</p>'}
+    <h3 style="font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--arena);margin:14px 0 8px;">Evolución mes a mes</h3>
+    ${monthly.length === 0 ? '<p class="card">Todavía no se cargaron informes mensuales para este cliente.</p>' : monthly.map((r) => reportCard(r, false)).join("")}
 
     <div id="uploadModalRoot"></div>
+    <div id="payModalRoot"></div>
   </main>`;
   drawChart("chartClient", "bar");
 }
+
 async function registerPayment(e) {
   e.preventDefault();
   const { client } = window.__currentClient;
+  const msg = document.getElementById("payMsg");
   const amount = Number(document.getElementById("payAmount").value);
   const month = document.getElementById("payMonth").value;
-  const service = document.getElementById("payService").value;
+  const services = getCheckedServices("pay");
   const detail = document.getElementById("payDetail").value.trim();
-  const { error } = await sb.from("payments").insert({ client_id: client.id, amount, period_month: `${month}-01`, service, service_detail: detail || null });
-  const msg = document.getElementById("payMsg");
-  if (error) { msg.textContent = "No se pudo registrar el pago."; return false; }
-  msg.textContent = "Pago registrado ✓";
+  const files = document.getElementById("payFiles").files;
+  if (!services.length) { msg.textContent = "Elegí al menos un servicio."; return false; }
+  const btn = document.getElementById("payBtn");
+  btn.disabled = true; btn.textContent = "Guardando...";
+  const { data, error } = await sb.from("payments").insert({
+    client_id: client.id, amount, period_month: `${month}-01`,
+    service: services[0], services, service_detail: detail || null, attachments: [],
+  }).select().single();
+  if (error) {
+    msg.textContent = `No se pudo registrar el pago (${error.message}). Si es la primera vez con esta versión, ejecutá el SQL de migración en Supabase.`;
+    btn.disabled = false; btn.textContent = "Registrar";
+    return false;
+  }
+  let warn = "";
+  if (files.length) {
+    const up = await uploadPaymentFiles(client.id, data.id, files);
+    if (up.ok.length) await sb.from("payments").update({ attachments: up.ok }).eq("id", data.id);
+    if (up.failed.length) warn = "El pago se guardó, pero algunos archivos no se pudieron subir:\n" + up.failed.join("\n");
+  }
   await viewClienteDetalle(client.id);
+  if (warn) alert(warn);
   return false;
+}
+
+function openPaymentEdit(id) {
+  const p = window.__currentClient.payments.find((x) => String(x.id) === String(id));
+  if (!p) return;
+  const atts = getAtt(p);
+  document.getElementById("payModalRoot").innerHTML = `
+  <div class="modal-backdrop" onclick="if(event.target===this) closePaymentEdit()">
+    <div class="modal" style="max-width:520px;max-height:90vh;overflow-y:auto;">
+      <h3 style="font-family:'Sora';font-weight:800;margin:0 0 14px;">Editar pago</h3>
+      <form onsubmit="return savePaymentEdit(event,'${p.id}')">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+          <div><label class="field-label">Monto</label><input type="number" id="epAmount" required value="${Number(p.amount || 0)}" style="width:100%;"></div>
+          <div><label class="field-label">Mes</label><input type="month" id="epMonth" required value="${monthKey(p.period_month)}" style="width:100%;"></div>
+        </div>
+        <label class="field-label">Servicios incluidos</label>
+        <div>${serviceChecksHtml("ep", paymentServices(p))}</div>
+        <label class="field-label" style="margin-top:6px;">Detalle</label>
+        <input id="epDetail" value="${escapeHtml(p.service_detail || "")}" style="width:100%;margin-bottom:12px;">
+        ${atts.length ? `<label class="field-label">Archivos actuales (marcá los que quieras quitar)</label>
+        <div style="margin-bottom:12px;">${atts.map((a) => `<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px;"><input type="checkbox" class="epRemove" value="${escapeHtml(a.path)}"> ${fileIcon(a.name)} ${escapeHtml(a.name)}</label>`).join("")}</div>` : ""}
+        <label class="field-label">Agregar archivos</label>
+        <input type="file" id="epFiles" multiple accept="${ATTACH_ACCEPT}" style="width:100%;margin-bottom:12px;">
+        <p id="epError" style="color:#dc2626;font-size:13px;"></p>
+        <div style="display:flex;justify-content:flex-end;gap:10px;">
+          <button type="button" onclick="closePaymentEdit()" style="background:none;border:none;color:rgba(7,10,15,.6);cursor:pointer;">Cancelar</button>
+          <button class="btn btn-primary" id="epBtn">Guardar cambios</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+function closePaymentEdit() { const r = document.getElementById("payModalRoot"); if (r) r.innerHTML = ""; }
+
+async function savePaymentEdit(e, id) {
+  e.preventDefault();
+  const { client, payments } = window.__currentClient;
+  const p = payments.find((x) => String(x.id) === String(id));
+  const errEl = document.getElementById("epError");
+  const services = getCheckedServices("ep");
+  if (!services.length) { errEl.textContent = "Elegí al menos un servicio."; return false; }
+  const btn = document.getElementById("epBtn");
+  btn.disabled = true; btn.textContent = "Guardando...";
+  const removed = [...document.querySelectorAll(".epRemove:checked")].map((c) => c.value);
+  const keep = getAtt(p).filter((a) => !removed.includes(a.path));
+  const files = document.getElementById("epFiles").files;
+  let up = { ok: [], failed: [] };
+  if (files.length) up = await uploadPaymentFiles(client.id, p.id, files);
+  const { data, error } = await sb.from("payments").update({
+    amount: Number(document.getElementById("epAmount").value),
+    period_month: `${document.getElementById("epMonth").value}-01`,
+    service: services[0], services,
+    service_detail: document.getElementById("epDetail").value.trim() || null,
+    attachments: keep.concat(up.ok),
+  }).eq("id", p.id).select();
+  if (error || !data || data.length === 0) {
+    errEl.textContent = error ? `No se pudo guardar (${error.message}).` : "No se pudo guardar: Supabase no dejó modificar el pago (revisá las políticas del SQL de migración).";
+    btn.disabled = false; btn.textContent = "Guardar cambios";
+    return false;
+  }
+  if (removed.length) await sb.storage.from(BUCKET).remove(removed);
+  closePaymentEdit();
+  await viewClienteDetalle(client.id);
+  if (up.failed.length) alert("Algunos archivos no se pudieron subir:\n" + up.failed.join("\n"));
+  return false;
+}
+
+async function deletePayment(id) {
+  const { client, payments } = window.__currentClient;
+  const p = payments.find((x) => String(x.id) === String(id));
+  if (!p) return;
+  if (!confirm(`¿Quitar el pago de ${formatCurrency(p.amount)} de ${monthKeyLabel(p.period_month)}? Se borran también sus archivos adjuntos.`)) return;
+  const { data, error } = await sb.from("payments").delete().eq("id", p.id).select();
+  if (error || !data || data.length === 0) { alert(error ? `No se pudo quitar el pago (${error.message}).` : "Supabase no dejó borrar el pago (revisá las políticas del SQL de migración)."); return; }
+  const paths = getAtt(p).map((a) => a.path);
+  if (paths.length) await sb.storage.from(BUCKET).remove(paths);
+  await viewClienteDetalle(client.id);
+}
+async function deleteReport(id) {
+  const { client } = window.__currentClient;
+  if (!confirm("¿Eliminar este informe?")) return;
+  const { data, error } = await sb.from("reports").delete().eq("id", id).select();
+  if (error || !data || data.length === 0) { alert("No se pudo eliminar el informe. Revisá las políticas del SQL de migración."); return; }
+  await viewClienteDetalle(client.id);
 }
 async function deleteClient(id) {
   if (!confirm("¿Eliminar este cliente? Se borrarán también sus pagos e informes.")) return;
@@ -725,8 +927,15 @@ function openUploadModal() {
       <h3 style="font-family:'Sora';font-weight:800;margin:0 0 4px;">Cargar informe de rendimiento</h3>
       <p style="font-size:13px;color:rgba(7,10,15,.6);margin:0 0 16px;">Excel, Word, HTML, CSV o .txt. Solo se guardan los datos extraídos, no el archivo.</p>
       <form onsubmit="return handleUploadReport(event)">
-        <label class="field-label">¿De qué mes son estos datos?</label>
-        <input type="month" id="repMonth" required value="${new Date().toISOString().slice(0, 7)}" style="width:100%;margin-bottom:12px;">
+        <label class="field-label">Tipo de informe</label>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;font-size:14px;">
+          <label><input type="radio" name="repKind" value="mensual" checked onchange="toggleRepKind()"> Informe mensual (evolución con Muta)</label>
+          <label><input type="radio" name="repKind" value="previo" onchange="toggleRepKind()"> Informe previo (antes de iniciar con Muta)</label>
+        </div>
+        <div id="repMonthWrap">
+          <label class="field-label">¿De qué mes son estos datos?</label>
+          <input type="month" id="repMonth" required value="${localMonthStr()}" style="width:100%;margin-bottom:12px;">
+        </div>
         <label class="field-label">Archivo</label>
         <input type="file" id="repFile" required accept=".xlsx,.xls,.csv,.docx,.txt,.html,.htm" style="width:100%;margin-bottom:12px;">
         <p id="repError" style="color:#dc2626;font-size:13px;"></p>
@@ -738,16 +947,23 @@ function openUploadModal() {
     </div>
   </div>`;
 }
+function toggleRepKind() {
+  const kind = document.querySelector('input[name="repKind"]:checked').value;
+  document.getElementById("repMonthWrap").classList.toggle("hidden", kind === "previo");
+  document.getElementById("repMonth").required = kind !== "previo";
+}
 function closeUploadModal() { const r = document.getElementById("uploadModalRoot"); if (r) r.innerHTML = ""; }
 async function handleUploadReport(e) {
   e.preventDefault();
-  const { client } = window.__currentClient;
+  const { client, reports } = window.__currentClient;
   const fileInput = document.getElementById("repFile");
-  const month = document.getElementById("repMonth").value;
+  const kind = document.querySelector('input[name="repKind"]:checked').value;
   const file = fileInput.files[0];
   const errEl = document.getElementById("repError");
   const btn = document.getElementById("repSubmitBtn");
   if (!file) return false;
+  const oldBaseline = reports.find((r) => r.kind === "previo");
+  if (kind === "previo" && oldBaseline && !confirm("Ya hay un informe previo cargado. ¿Reemplazarlo por este?")) return false;
   btn.disabled = true; btn.textContent = "Procesando...";
   try {
     const ext = file.name.split(".").pop().toLowerCase();
@@ -759,14 +975,24 @@ async function handleUploadReport(e) {
     else if (ext === "txt") { metrics = parseTextReport(await file.text()).metrics; }
     else { throw new Error(`Formato .${ext} no soportado.`); }
 
-    const periodMonth = `${month}-01`;
-    const { data: prevReports } = await sb.from("reports").select("*").eq("client_id", client.id).lt("period_month", periodMonth).order("period_month", { ascending: false }).limit(1);
-    const previous = prevReports?.[0]?.metrics || {};
-    const comparison = compareMetrics(metrics, previous);
-    const summary = buildLocalSummary(comparison, { clientName: client.name, periodLabel: month });
-
-    const { error } = await sb.from("reports").insert({ client_id: client.id, period_month: periodMonth, source_name: file.name, source_type: ext, metrics, summary });
-    if (error) throw error;
+    let periodMonth, summary;
+    if (kind === "previo") {
+      // El informe previo se guarda en el mes anterior al inicio del trabajo conjunto.
+      periodMonth = `${addMonthsKey(monthKey(client.start_date), -1)}-01`;
+      summary = "Informe previo: punto de partida del cliente antes de iniciar con Muta. Sirve de base para medir la evolución.";
+    } else {
+      const month = document.getElementById("repMonth").value;
+      periodMonth = `${month}-01`;
+      const monthlyBefore = reports.filter((r) => r.kind !== "previo" && r.period_month < periodMonth)
+        .sort((a, b) => (a.period_month < b.period_month ? 1 : -1))[0];
+      const base = monthlyBefore || oldBaseline;
+      const baseLabel = monthlyBefore ? `el mes anterior (${monthKeyLabel(monthlyBefore.period_month)})` : "antes de iniciar con Muta";
+      const comparison = compareMetrics(metrics, base?.metrics || {});
+      summary = buildLocalSummary(comparison, { clientName: client.name, periodLabel: monthKeyLabel(periodMonth), baseLabel });
+    }
+    const { error } = await sb.from("reports").insert({ client_id: client.id, period_month: periodMonth, source_name: file.name, source_type: ext, metrics, summary, kind });
+    if (error) throw new Error(`${error.message}. Si es la primera vez con esta versión, ejecutá el SQL de migración en Supabase.`);
+    if (kind === "previo" && oldBaseline) await sb.from("reports").delete().eq("id", oldBaseline.id);
     closeUploadModal();
     await viewClienteDetalle(client.id);
   } catch (err) {
@@ -784,24 +1010,72 @@ async function viewReporte(id) {
     sb.from("payments").select("*").eq("client_id", id).order("period_month"),
     sb.from("reports").select("*").eq("client_id", id).order("period_month", { ascending: false }),
   ]);
-  window.__reportData = { client, payments: payments || [], reports: reports || [], selectedMonth: reports?.[0] ? reports[0].period_month.slice(0, 7) : "" };
+  const rs = reports || [];
+  const monthly = rs.filter((r) => r.kind !== "previo");
+  window.__reportData = { client, payments: payments || [], reports: rs, selectedMonth: monthly[0] ? monthly[0].period_month.slice(0, 7) : "", compareMode: "anterior", compareMonth: "" };
   renderReporte();
 }
+// Devuelve { report, label } con el informe contra el que se compara, según la opción elegida.
+function resolveCompareBase() {
+  const { reports, selectedMonth, compareMode, compareMonth } = window.__reportData;
+  const baseline = reports.find((r) => r.kind === "previo");
+  const monthly = reports.filter((r) => r.kind !== "previo" && r.period_month.slice(0, 7) !== selectedMonth)
+    .sort((a, b) => (a.period_month < b.period_month ? -1 : 1));
+  if (compareMode === "previo") return baseline ? { report: baseline, label: "antes de iniciar con Muta" } : null;
+  if (compareMode === "inicio") { const f = monthly[0]; return f ? { report: f, label: `el primer mes de gestión (${monthKeyLabel(f.period_month)})` } : null; }
+  if (compareMode === "anterior") {
+    const cur = selectedMonth + "-01";
+    const prev = monthly.filter((r) => r.period_month < cur).pop();
+    return prev ? { report: prev, label: `el mes anterior (${monthKeyLabel(prev.period_month)})` } : null;
+  }
+  if (compareMode === "custom") {
+    if (compareMonth === "previo" && baseline) return { report: baseline, label: "antes de iniciar con Muta" };
+    const r = monthly.find((x) => x.period_month.slice(0, 7) === compareMonth) || (compareMonth ? null : monthly[0]);
+    return r ? { report: r, label: monthKeyLabel(r.period_month) } : null;
+  }
+  return null;
+}
 function renderReporte() {
-  const { client, payments, reports, selectedMonth } = window.__reportData;
-  const currentReport = reports.find((r) => r.period_month.slice(0, 7) === selectedMonth) || reports[0];
+  const rd = window.__reportData;
+  const { client, payments, reports, selectedMonth, compareMode, compareMonth } = rd;
+  const baseline = reports.find((r) => r.kind === "previo");
+  const monthly = reports.filter((r) => r.kind !== "previo");
+  const currentReport = monthly.find((r) => r.period_month.slice(0, 7) === selectedMonth) || monthly[0];
   const byMonth = groupPaymentsByMonth(payments);
   const months = lastNMonthKeys(6);
   const total = totalSpent(payments);
-  const monthOptions = reports.length
-    ? reports.map((r) => `<option value="${r.period_month.slice(0, 7)}" ${r.period_month.slice(0, 7) === selectedMonth ? "selected" : ""}>${monthKeyLabel(r.period_month)}</option>`).join("")
-    : '<option value="">Sin informes cargados</option>';
+  const monthOptions = monthly.length
+    ? monthly.map((r) => `<option value="${r.period_month.slice(0, 7)}" ${r.period_month.slice(0, 7) === selectedMonth ? "selected" : ""}>${monthKeyLabel(r.period_month)}</option>`).join("")
+    : '<option value="">Sin informes mensuales</option>';
+  const modeOpts = [["anterior", "Mes anterior"], ["previo", "Antes de iniciar con Muta"], ["inicio", "Desde que iniciamos (primer mes)"], ["custom", "Otro mes a elegir…"]]
+    .map(([v, l]) => `<option value="${v}" ${compareMode === v ? "selected" : ""}>${l}</option>`).join("");
+  const customCandidates = [
+    ...(baseline ? [{ v: "previo", l: "Antes de iniciar con Muta" }] : []),
+    ...monthly.filter((r) => r.period_month.slice(0, 7) !== selectedMonth).map((r) => ({ v: r.period_month.slice(0, 7), l: monthKeyLabel(r.period_month) })),
+  ];
+  const customSelect = compareMode === "custom"
+    ? `<select onchange="window.__reportData.compareMonth=this.value; renderReporte();" style="border-radius:8px;padding:6px 10px;">${customCandidates.map((c) => `<option value="${c.v}" ${c.v === compareMonth ? "selected" : ""}>${c.l}</option>`).join("") || '<option value="">Sin otros informes</option>'}</select>`
+    : "";
+
+  const cmp = currentReport ? resolveCompareBase() : null;
+  let comparison = null, cmpSummary = "";
+  if (currentReport && cmp) {
+    comparison = compareMetrics(currentReport.metrics || {}, cmp.report.metrics || {});
+    cmpSummary = buildLocalSummary(comparison, { clientName: client.name, periodLabel: monthKeyLabel(currentReport.period_month), baseLabel: cmp.label });
+  }
+  const th = 'style="text-align:left;padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);"';
+  const td = 'style="padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);"';
+  const fmtChange = (c) => c === null ? "—" : `<span style="color:${c >= 0 ? "#15803d" : "#b91c1c"};font-weight:700;">${c >= 0 ? "▲" : "▼"} ${Math.abs(c)}%</span>`;
 
   app.innerHTML = `
   <div class="no-print" style="background:var(--negro);color:#fff;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;position:sticky;top:0;z-index:20;">
     <a href="#/clientes/${client.id}" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:14px;">← Volver a la ficha</a>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <span style="font-size:13px;color:rgba(255,255,255,.7);">Período</span>
       <select id="reportMonthSelect" onchange="window.__reportData.selectedMonth=this.value; renderReporte();" style="border-radius:8px;padding:6px 10px;">${monthOptions}</select>
+      <span style="font-size:13px;color:rgba(255,255,255,.7);">Comparar con</span>
+      <select onchange="window.__reportData.compareMode=this.value; window.__reportData.compareMonth=''; renderReporte();" style="border-radius:8px;padding:6px 10px;">${modeOpts}</select>
+      ${customSelect}
       <button class="btn btn-primary btn-sm" onclick="downloadReportHtml()">Descargar HTML</button>
       <button class="btn btn-primary btn-sm" onclick="window.print()">Descargar PDF</button>
     </div>
@@ -814,7 +1088,7 @@ function renderReporte() {
       </div>
       <p style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--arena);margin:0;">Informe de gestión</p>
       <h2 style="font-size:28px;font-weight:800;margin:4px 0 0;">${escapeHtml(client.name)}</h2>
-      <p style="color:rgba(7,10,15,.6);margin:2px 0 22px;">${selectedMonth ? monthKeyLabel(selectedMonth + "-01") : "Resumen general"}</p>
+      <p style="color:rgba(7,10,15,.6);margin:2px 0 22px;">${currentReport ? monthKeyLabel(currentReport.period_month) : "Resumen general"}${cmp ? ` · comparado con ${escapeHtml(cmp.label)}` : ""}</p>
       <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:22px;">
         <div style="flex:1;min-width:160px;background:#F5F6F8;border-radius:14px;padding:14px 16px;">
           <span style="display:block;font-size:12px;color:rgba(7,10,15,.5);">Total invertido con Muta</span>
@@ -822,7 +1096,7 @@ function renderReporte() {
         </div>
         <div style="flex:1;min-width:160px;background:#F5F6F8;border-radius:14px;padding:14px 16px;">
           <span style="display:block;font-size:12px;color:rgba(7,10,15,.5);">Trabajando juntos desde</span>
-          <strong style="font-size:18px;">${new Date(client.start_date).toLocaleDateString("es-AR", { month: "long", year: "numeric" })}</strong>
+          <strong style="font-size:18px;">${parseLocalDate(client.start_date).toLocaleDateString("es-AR", { month: "long", year: "numeric" })}</strong>
         </div>
         <div style="flex:1;min-width:160px;background:#F5F6F8;border-radius:14px;padding:14px 16px;">
           <span style="display:block;font-size:12px;color:rgba(7,10,15,.5);">Pagos registrados</span>
@@ -832,18 +1106,23 @@ function renderReporte() {
       ${currentReport ? `
       <div style="margin-bottom:22px;">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:8px;">Resumen del período</h3>
-        <p style="font-size:14px;">${escapeHtml(currentReport.summary || "")}</p>
-        ${Object.keys(currentReport.metrics || {}).length ? `
+        <p style="font-size:14px;">${escapeHtml(cmp ? cmpSummary : (currentReport.summary || ""))}</p>
+        ${!cmp ? `<p class="no-print" style="font-size:13px;color:#b45309;">No hay un informe para comparar con la opción elegida. Probá con otra opción en “Comparar con”.</p>` : ""}
+        ${cmp ? `
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead><tr><th style="text-align:left;padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">Indicador</th><th style="text-align:left;padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">Total</th></tr></thead>
-          <tbody>${Object.values(currentReport.metrics).map((m) => `<tr><td style="padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">${escapeHtml(m.label)}</td><td style="padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">${m.total}</td></tr>`).join("")}</tbody>
-        </table>` : ""}
-      </div>` : ""}
+          <thead><tr><th ${th}>Indicador</th><th ${th}>${escapeHtml(cmp.report.kind === "previo" ? "Antes de iniciar" : monthKeyLabel(cmp.report.period_month))}</th><th ${th}>${monthKeyLabel(currentReport.period_month)}</th><th ${th}>Variación</th></tr></thead>
+          <tbody>${comparison.filter((c) => c.current !== null).slice(0, 25).map((c) => `<tr><td ${td}>${escapeHtml(c.label)}</td><td ${td}>${c.previous ?? "—"}</td><td ${td}>${c.current}</td><td ${td}>${fmtChange(c.changePct)}</td></tr>`).join("")}</tbody>
+        </table>` : (Object.keys(currentReport.metrics || {}).length ? `
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead><tr><th ${th}>Indicador</th><th ${th}>Total</th></tr></thead>
+          <tbody>${Object.values(currentReport.metrics).map((m) => `<tr><td ${td}>${escapeHtml(m.label)}</td><td ${td}>${m.total}</td></tr>`).join("")}</tbody>
+        </table>` : "")}
+      </div>` : `<p style="font-size:14px;color:rgba(7,10,15,.6);margin-bottom:22px;">Todavía no hay informes mensuales cargados para este cliente.</p>`}
       <div style="margin-bottom:22px;">
         <h3 style="font-size:16px;font-weight:800;margin-bottom:8px;">Evolución de la inversión mensual</h3>
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead><tr><th style="text-align:left;padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">Mes</th><th style="text-align:left;padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">Monto</th></tr></thead>
-          <tbody>${months.map((m) => `<tr><td style="padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">${monthKeyLabel(m)}</td><td style="padding:6px 8px;border-bottom:1px solid rgba(7,10,15,.08);">${formatCurrency(byMonth[m] || 0)}</td></tr>`).join("")}</tbody>
+          <thead><tr><th ${th}>Mes</th><th ${th}>Monto</th></tr></thead>
+          <tbody>${months.map((m) => `<tr><td ${td}>${monthKeyLabel(m)}</td><td ${td}>${formatCurrency(byMonth[m] || 0)}</td></tr>`).join("")}</tbody>
         </table>
       </div>
       <div style="border-top:1px solid rgba(7,10,15,.1);padding-top:12px;font-size:12px;color:rgba(7,10,15,.5);">
