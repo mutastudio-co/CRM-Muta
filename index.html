@@ -64,6 +64,22 @@
   .eye-card{position:relative;}
   .eye-btn{position:absolute;top:10px;right:10px;background:none;border:none;cursor:pointer;padding:4px;line-height:0;color:rgba(7,10,15,.45);border-radius:8px;}
   .eye-btn:hover{color:var(--negro);background:rgba(7,10,15,.06);}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:middle;flex-shrink:0;}
+  .dot-verde{background:#22c55e;} .dot-amarillo{background:#facc15;} .dot-rojo{background:#ef4444;} .dot-gris{background:#cbd5e1;}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:rgba(7,10,15,.55);margin:0 0 12px;}
+  .legend .dot{margin-right:5px;width:9px;height:9px;}
+  .btn-wa{background:#25D366;color:#fff;display:inline-flex;align-items:center;gap:7px;}
+  .alert-stack{position:fixed;top:64px;right:16px;width:min(300px,calc(100vw - 32px));max-height:calc(100vh - 90px);overflow-y:auto;z-index:15;display:flex;flex-direction:column;gap:10px;pointer-events:none;}
+  .alert-item{pointer-events:auto;background:#fff;border:1px solid rgba(239,68,68,.35);border-left:4px solid #ef4444;border-radius:12px;box-shadow:0 6px 20px rgba(7,10,15,.15);padding:10px 34px 10px 12px;position:relative;font-size:13px;}
+  .alert-item b{display:block;margin-bottom:2px;}
+  .alert-item a{color:var(--turquesa);font-weight:700;text-decoration:none;font-size:12px;}
+  .alert-x,.modal-x{position:absolute;top:6px;right:8px;background:none;border:none;font-size:20px;line-height:1;cursor:pointer;color:rgba(7,10,15,.45);padding:2px 6px;border-radius:8px;}
+  .alert-x:hover,.modal-x:hover{color:var(--negro);background:rgba(7,10,15,.06);}
+  .rank-chip{border:1px solid rgba(7,10,15,.15);background:#fff;color:rgba(7,10,15,.7);border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;margin:0 6px 6px 0;}
+  .rank-chip.on{background:var(--negro);color:#fff;border-color:var(--negro);}
+  .rank-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:9px 0;border-top:1px solid rgba(7,10,15,.06);}
+  .rank-bar{height:6px;border-radius:99px;background:rgba(7,10,15,.06);margin-top:5px;overflow:hidden;}
+  .rank-bar>div{height:100%;background:var(--turquesa);border-radius:99px;}
   @media print{ .no-print{display:none !important;} body{background:#fff;} }
 </style>
 </head>
@@ -140,6 +156,35 @@ function computeClientStatus(payments) {
   const diffDays = (Date.now() - last.getTime()) / (1000 * 60 * 60 * 24);
   return diffDays > INACTIVE_AFTER_DAYS ? "inactivo" : "activo";
 }
+// Semáforo de pago del mes: verde = pagó este mes; amarillo = todavía no pagó pero estamos
+// dentro de los primeros 10 días; rojo = pasó el día 10 sin pagar. Inactivos y sin pagos van en gris.
+const PAY_DEADLINE_DAY = 10;
+function paymentAlert(payments) {
+  const status = computeClientStatus(payments);
+  if (status === "sin_pagos") return { level: "gris", label: "Sin pagos registrados" };
+  if (status === "inactivo") return { level: "gris", label: "Cliente inactivo" };
+  const paid = (payments || []).some((p) => monthKey(p.period_month) === localMonthStr());
+  if (paid) return { level: "verde", label: "Pagó este mes" };
+  if (new Date().getDate() <= PAY_DEADLINE_DAY) return { level: "amarillo", label: `Pago pendiente (plazo hasta el ${PAY_DEADLINE_DAY})` };
+  return { level: "rojo", label: "No pagó este mes" };
+}
+// Arma el número para wa.me a partir del texto de contacto (formato Argentina por defecto)
+function waNumber(contact) {
+  const txt = String(contact || "").replace(/\S+@\S+/g, " ");
+  const m = txt.match(/\+?\d[\d\s().\-]{6,}\d/);
+  if (!m) return null;
+  const raw = m[0].trim();
+  let d = raw.replace(/\D/g, "");
+  if (d.length < 8) return null;
+  if (raw.startsWith("+")) return d;
+  if (d.startsWith("00")) return d.slice(2);
+  if (d.startsWith("54") && d.length >= 12) { const rest = d.slice(2); return rest.startsWith("9") ? d : "549" + rest; }
+  if (d.startsWith("0")) d = d.slice(1);
+  if (d.length === 12) { for (const a of [2, 3, 4]) { if (d.slice(a, a + 2) === "15") { d = d.slice(0, a) + d.slice(a + 2); break; } } }
+  if (d.length === 10) return "549" + d;
+  return d.length >= 11 && d.length <= 15 ? d : null;
+}
+const WA_ICON = '<svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 0 0-8.6 15L2 22l5.2-1.4A10 10 0 1 0 12 2zm0 18.2a8.2 8.2 0 0 1-4.2-1.2l-.3-.2-3.1.8.8-3-.2-.3A8.2 8.2 0 1 1 12 20.2zm4.5-6.1c-.2-.1-1.5-.7-1.7-.8-.2-.1-.4-.1-.6.1l-.8 1c-.1.2-.3.2-.5.1-.8-.4-1.700-.9-2.600-2.100-.2-.2 0-.4.1-.5l.4-.5.2-.4c.1-.1 0-.3 0-.4l-.8-1.800c-.2-.5-.4-.4-.6-.4h-.5c-.2 0-.4.1-.7.3-.2.300-.9.9-.9 2.200s.9 2.500 1 2.700c.1.2 1.800 2.800 4.400 3.900 1.600.7 2.200.7 3 .6.5-.1 1.500-.6 1.700-1.200.2-.6.2-1.100.2-1.200-.1-.1-.2-.2-.5-.3z"/></svg>';
 function statusLabel(s) { return { activo: "Activo", inactivo: "Inactivo", sin_pagos: "Sin pagos" }[s] || s; }
 function totalSpent(payments) { return (payments || []).reduce((s, p) => s + Number(p.amount || 0), 0); }
 function monthsWorkingTogether(startDate) {
@@ -508,17 +553,26 @@ async function viewDashboard() {
   const totalRevenue = pay.reduce((s, p) => s + Number(p.amount || 0), 0);
   const thisMonthRevenue = byMonth[months[months.length - 1]] || 0;
 
-  window.__money = { month: thisMonthRevenue, total: totalRevenue, hidden: window.__money ? window.__money.hidden : false };
+  const curFin = financeByMonth[months[months.length - 1]] || {};
+  const monthCosts = Number(curFin.investment || 0) + Number(curFin.expenses || 0);
+  window.__money = { month: thisMonthRevenue, total: totalRevenue, profit: thisMonthRevenue - monthCosts, costs: monthCosts, hidden: window.__money ? window.__money.hidden : false };
+  window.__rankData = { clients: cl, payments: pay };
+  window.__dismissed = window.__dismissed || new Set();
+  const redAlerts = cl.map((c) => ({ c, a: paymentAlert(pay.filter((p) => p.client_id === c.id)) })).filter((x) => x.a.level === "rojo");
   window.__revenueDataForInsights = revLabels.map((n, i) => ({ name: n, value: revValues[i] }));
 
   app.innerHTML = `
   ${navHtml("dashboard")}
   <main>
-    <h1 class="page-title">Panel general de Muta</h1>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:20px;">
+      <h1 class="page-title" style="margin:0;">Panel general de Muta</h1>
+      <button class="btn btn-dark btn-sm" onclick="openRanking()">🏆 Ranking de clientes</button>
+    </div>
     <div class="grid grid-4">
       <div class="card"><p class="stat-label">Clientes activos</p><p class="stat-value">${active}</p></div>
       <div class="card"><p class="stat-label">Clientes inactivos</p><p class="stat-value">${inactive}</p></div>
       <div class="card eye-card"><button class="eye-btn" id="eyeBtn1" onclick="toggleMoney()" title="Mostrar / ocultar"></button><p class="stat-label">Ingresos este mes</p><p class="stat-value" id="moneyMonth"></p></div>
+      <div class="card eye-card"><button class="eye-btn" id="eyeBtn3" onclick="toggleMoney()" title="Mostrar / ocultar"></button><p class="stat-label">Ganancia del mes</p><p class="stat-value" id="moneyProfit"></p><p class="stat-label" id="moneyProfitNote" style="margin-top:2px;">Ingresos − inversión − gastos</p></div>
       <div class="card eye-card"><button class="eye-btn" id="eyeBtn2" onclick="toggleMoney()" title="Mostrar / ocultar"></button><p class="stat-label">Ingresos históricos</p><p class="stat-value" id="moneyTotal"></p></div>
     </div>
     <div class="grid grid-2">
@@ -544,7 +598,10 @@ async function viewDashboard() {
         <span id="financeMsg" style="font-size:13px;color:rgba(7,10,15,.6);"></span>
       </form>
     </div>
-  </main>`;
+  </main>
+  <div id="alertStack" class="alert-stack no-print"></div>
+  <div id="rankModalRoot"></div>`;
+  renderAlerts(redAlerts);
   applyMoneyVisibility();
   drawChart("chartRevenue", "bar");
   drawChart("chartInvestment", "bar");
@@ -559,13 +616,99 @@ function applyMoneyVisibility() {
   const a = document.getElementById("moneyMonth"), b = document.getElementById("moneyTotal");
   if (a) a.textContent = m.hidden ? randomDots() : formatCurrency(m.month);
   if (b) b.textContent = m.hidden ? randomDots() : formatCurrency(m.total);
-  ["eyeBtn1", "eyeBtn2"].forEach((id) => { const el = document.getElementById(id); if (el) el.innerHTML = m.hidden ? EYE_OFF : EYE_OPEN; });
+  const c = document.getElementById("moneyProfit");
+  if (c) { c.textContent = m.hidden ? randomDots() : formatCurrency(m.profit); c.style.color = !m.hidden && m.profit < 0 ? "#dc2626" : ""; }
+  const note = document.getElementById("moneyProfitNote");
+  if (note) note.textContent = m.hidden ? "Ingresos − inversión − gastos" : `Ingresos − inversión − gastos (${formatCurrency(m.costs)} cargados)`;
+  ["eyeBtn1", "eyeBtn2", "eyeBtn3"].forEach((id) => { const el = document.getElementById(id); if (el) el.innerHTML = m.hidden ? EYE_OFF : EYE_OPEN; });
 }
 function toggleMoney() {
   if (!window.__money) return;
   window.__money.hidden = !window.__money.hidden;
   applyMoneyVisibility();
+  if (document.getElementById("rankModalBox")) renderRanking();
 }
+
+// ---- Notificaciones de clientes en rojo (reaparecen cada vez que se entra al programa) ----
+function renderAlerts(list) {
+  const box = document.getElementById("alertStack");
+  if (!box) return;
+  const mes = monthKeyLabel(localMonthStr());
+  box.innerHTML = list.filter((x) => !window.__dismissed.has(x.c.id)).map((x) => `
+    <div class="alert-item">
+      <button class="alert-x" title="Cerrar" onclick="dismissAlert('${x.c.id}')">×</button>
+      <b><span class="dot dot-rojo"></span>${escapeHtml(x.c.name)}</b>
+      <span style="color:rgba(7,10,15,.65);">No registra pago de ${escapeHtml(mes)}.</span><br>
+      <a href="#/clientes/${x.c.id}">Ver ficha →</a>
+    </div>`).join("");
+}
+function dismissAlert(id) {
+  window.__dismissed.add(id);
+  const el = event && event.target ? event.target.closest(".alert-item") : null;
+  if (el) el.remove();
+}
+
+// ---- Ranking de clientes por facturación (ventana emergente con filtro por plan) ----
+window.__rankServices = new Set();
+function openRanking() { window.__rankServices = new Set(); renderRanking(); }
+function closeRanking() { const r = document.getElementById("rankModalRoot"); if (r) r.innerHTML = ""; }
+function toggleRankService(sv) {
+  if (sv === "__all") window.__rankServices.clear();
+  else if (window.__rankServices.has(sv)) window.__rankServices.delete(sv);
+  else window.__rankServices.add(sv);
+  renderRanking();
+}
+function computeRanking() {
+  const { clients, payments } = window.__rankData || { clients: [], payments: [] };
+  const sel = window.__rankServices;
+  const totals = {};
+  for (const p of payments) {
+    let amt = Number(p.amount || 0);
+    if (sel.size) {
+      const svcs = paymentServices(p);
+      const share = amt / (svcs.length || 1);
+      amt = svcs.filter((sv) => sel.has(sv)).length * share;
+    }
+    if (amt > 0) totals[p.client_id] = (totals[p.client_id] || 0) + amt;
+  }
+  const rows = clients.filter((c) => totals[c.id] > 0).map((c) => ({ id: c.id, name: c.name, amount: totals[c.id] })).sort((a, b) => b.amount - a.amount);
+  const sum = rows.reduce((t, r) => t + r.amount, 0);
+  return { rows, sum };
+}
+function renderRanking() {
+  const root = document.getElementById("rankModalRoot");
+  if (!root) return;
+  const hidden = window.__money && window.__money.hidden;
+  const sel = window.__rankServices;
+  const { rows, sum } = computeRanking();
+  const max = rows.length ? rows[0].amount : 0;
+  root.innerHTML = `
+  <div class="modal-backdrop" onclick="if(event.target===this)closeRanking()">
+    <div class="modal" id="rankModalBox" style="max-width:560px;max-height:88vh;overflow-y:auto;position:relative;">
+      <button class="modal-x" title="Cerrar" onclick="closeRanking()">×</button>
+      <h3 style="font-family:'Sora';font-weight:800;font-size:18px;margin:0 0 4px;">Ranking de clientes</h3>
+      <p style="font-size:13px;color:rgba(7,10,15,.55);margin:0 0 12px;">Por facturación histórica. Elegí uno o varios planes para filtrar.</p>
+      <div style="margin-bottom:8px;">
+        <button class="rank-chip ${sel.size === 0 ? "on" : ""}" onclick="toggleRankService('__all')">Todos los planes</button>
+        ${Object.entries(SERVICE_LABELS).map(([v, l]) => `<button class="rank-chip ${sel.has(v) ? "on" : ""}" onclick="toggleRankService('${v}')">${l}</button>`).join("")}
+      </div>
+      ${rows.length === 0 ? '<p style="color:rgba(7,10,15,.5);padding:14px 0;">No hay pagos para esta selección.</p>' : rows.map((r, i) => `
+      <div class="rank-row">
+        <span style="font-weight:800;color:rgba(7,10,15,.4);">${i + 1}</span>
+        <div style="min-width:0;">
+          <a href="#/clientes/${r.id}" onclick="closeRanking()" style="font-weight:600;text-decoration:none;">${escapeHtml(r.name)}</a>
+          <div class="rank-bar"><div style="width:${hidden ? 0 : Math.max(2, (r.amount / max) * 100)}%;"></div></div>
+        </div>
+        <div style="text-align:right;font-size:13px;">
+          <div style="font-weight:700;">${hidden ? "••••••" : formatCurrency(r.amount)}</div>
+          <div style="color:rgba(7,10,15,.5);">${hidden ? "••" : Math.round((r.amount / sum) * 100) + "%"}</div>
+        </div>
+      </div>`).join("")}
+      ${rows.length ? `<p style="font-size:13px;color:rgba(7,10,15,.55);margin:12px 0 0;border-top:1px solid rgba(7,10,15,.06);padding-top:10px;">Total del ranking: <b>${hidden ? "••••••" : formatCurrency(sum)}</b> · ${rows.length} cliente${rows.length !== 1 ? "s" : ""}</p>` : ""}
+    </div>
+  </div>`;
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeRanking(); });
 function interpretEvolution() {
   const el = document.getElementById("evolutionSummary");
   el.textContent = "Analizando...";
@@ -596,7 +739,7 @@ async function viewClientes() {
   const { data: payments } = await sb.from("payments").select("*");
   const rows = (clients || []).map((c) => {
     const cp = (payments || []).filter((p) => p.client_id === c.id);
-    return { ...c, status: computeClientStatus(cp), total: totalSpent(cp), months: monthsWorkingTogether(c.start_date) };
+    return { ...c, status: computeClientStatus(cp), alert: paymentAlert(cp), total: totalSpent(cp), months: monthsWorkingTogether(c.start_date) };
   });
   window.__clientRows = rows;
   renderClientesTable("todos", "");
@@ -620,13 +763,19 @@ function renderClientesTable(filter, search) {
       <input id="clientSearch" placeholder="Buscar por nombre..." value="${escapeHtml(search)}" style="flex:1;min-width:200px;" oninput="renderClientesTable(window.__clientFilter||'todos', this.value)">
       ${filters.map((f) => `<button class="btn btn-sm" style="${filter === f ? "background:var(--negro);color:#fff;" : "background:rgba(7,10,15,.05);color:rgba(7,10,15,.6);"}" onclick="renderClientesTable('${f}', document.getElementById('clientSearch')?.value||'')">${filterLabel[f]}</button>`).join("")}
     </div>
+    <div class="legend">
+      <span><span class="dot dot-verde"></span>Pagó este mes</span>
+      <span><span class="dot dot-amarillo"></span>Pendiente (hasta el día ${PAY_DEADLINE_DAY})</span>
+      <span><span class="dot dot-rojo"></span>Atrasado (pasó el día ${PAY_DEADLINE_DAY})</span>
+      <span><span class="dot dot-gris"></span>Inactivo / sin pagos</span>
+    </div>
     <div class="card" style="padding:0;overflow:hidden;">
       ${rows.length === 0 ? '<p style="padding:20px;color:rgba(7,10,15,.5);">No hay clientes para mostrar.</p>' : `
       <table>
         <thead><tr><th>Cliente</th><th>Trabajando desde</th><th>Total gastado</th><th>Estado</th><th></th></tr></thead>
         <tbody>
           ${rows.map((c) => `<tr>
-            <td style="font-weight:600;">${escapeHtml(c.name)}</td>
+            <td style="font-weight:600;"><span class="dot dot-${c.alert.level}" title="${escapeHtml(c.alert.label)}"></span>${escapeHtml(c.name)}</td>
             <td>${formatMonthsLabel(c.months)}</td>
             <td>${formatCurrency(c.total)}</td>
             <td><span class="badge badge-${c.status}">${statusLabel(c.status)}</span></td>
@@ -729,6 +878,8 @@ async function openAttachment(paymentId, idx) {
 function renderClienteDetalle() {
   const { client, payments, reports } = window.__currentClient;
   const status = computeClientStatus(payments);
+  const payAlert = paymentAlert(payments);
+  const waNum = waNumber(client.contact);
   const total = totalSpent(payments);
   const months = monthsWorkingTogether(client.start_date);
   const byMonth = groupPaymentsByMonth(payments);
@@ -759,11 +910,13 @@ function renderClienteDetalle() {
           <a class="back-btn" href="#/clientes" title="Volver a clientes">←</a>
           <h1 class="page-title" style="margin:0;">${escapeHtml(client.name)}</h1>
           <span class="badge badge-${status}">${statusLabel(status)}</span>
+          <span title="${escapeHtml(payAlert.label)}" style="display:inline-flex;align-items:center;font-size:12px;color:rgba(7,10,15,.6);"><span class="dot dot-${payAlert.level}" style="margin-right:5px;"></span>${escapeHtml(payAlert.label)}</span>
         </div>
         <p style="color:rgba(7,10,15,.6);font-size:14px;margin:4px 0 0;">Trabajando juntos hace ${formatMonthsLabel(months)} · Desde ${parseLocalDate(client.start_date).toLocaleDateString("es-AR")}</p>
         ${client.contact ? `<p style="color:rgba(7,10,15,.6);font-size:14px;">Contacto: ${escapeHtml(client.contact)}</p>` : ""}
       </div>
-      <div style="display:flex;gap:10px;align-items:center;">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        ${waNum ? `<a class="btn btn-wa" href="https://wa.me/${waNum}" target="_blank" rel="noopener">${WA_ICON} Contactar</a>` : ""}
         <a class="btn btn-dark" href="#/clientes/${client.id}/reporte">Exportar informe</a>
         <button style="background:none;border:none;color:#dc2626;cursor:pointer;font-size:13px;" onclick="deleteClient('${client.id}')">Eliminar cliente</button>
       </div>
