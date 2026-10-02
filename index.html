@@ -63,6 +63,7 @@
   .back-btn:hover{background:rgba(43,186,217,.25);}
   .eye-card{position:relative;}
   .eye-btn{position:absolute;top:10px;right:10px;background:none;border:none;cursor:pointer;padding:4px;line-height:0;color:rgba(7,10,15,.45);border-radius:8px;}
+  .eye-inline{position:static;display:inline-block;vertical-align:middle;margin-left:6px;padding:2px 4px;}
   .eye-btn:hover{color:var(--negro);background:rgba(7,10,15,.06);}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:middle;flex-shrink:0;}
   .dot-verde{background:#22c55e;} .dot-amarillo{background:#facc15;} .dot-rojo{background:#ef4444;} .dot-gris{background:#cbd5e1;}
@@ -442,10 +443,12 @@ async function handleLogin(e) {
     btn.disabled = false; btn.textContent = "Ingresar";
     return false;
   }
+  moneyHidden = true;
   location.hash = "#/";
   return false;
 }
 async function logout() {
+  moneyHidden = true;
   await sb.auth.signOut();
   location.hash = "#/login";
 }
@@ -555,7 +558,7 @@ async function viewDashboard() {
 
   const curFin = financeByMonth[months[months.length - 1]] || {};
   const monthCosts = Number(curFin.investment || 0) + Number(curFin.expenses || 0);
-  window.__money = { month: thisMonthRevenue, total: totalRevenue, profit: thisMonthRevenue - monthCosts, costs: monthCosts, hidden: window.__money ? window.__money.hidden : false };
+  window.__money = { month: thisMonthRevenue, total: totalRevenue, profit: thisMonthRevenue - monthCosts, costs: monthCosts };
   window.__rankData = { clients: cl, payments: pay };
   window.__dismissed = window.__dismissed || new Set();
   const redAlerts = cl.map((c) => ({ c, a: paymentAlert(pay.filter((p) => p.client_id === c.id)) })).filter((x) => x.a.level === "rojo");
@@ -608,24 +611,26 @@ async function viewDashboard() {
   drawChart("chartYear", "bar");
   drawChart("chartService", "bar");
 }
+// Los montos arrancan SIEMPRE ocultos al entrar (o recargar). Un solo estado para panel y clientes.
+let moneyHidden = true;
 const EYE_OPEN = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_OFF = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
 function randomDots() { return "•".repeat(5 + Math.floor(Math.random() * 4)); } // largo al azar: no revela la cifra
 function applyMoneyVisibility() {
   const m = window.__money; if (!m) return;
   const a = document.getElementById("moneyMonth"), b = document.getElementById("moneyTotal");
-  if (a) a.textContent = m.hidden ? randomDots() : formatCurrency(m.month);
-  if (b) b.textContent = m.hidden ? randomDots() : formatCurrency(m.total);
+  if (a) a.textContent = moneyHidden ? randomDots() : formatCurrency(m.month);
+  if (b) b.textContent = moneyHidden ? randomDots() : formatCurrency(m.total);
   const c = document.getElementById("moneyProfit");
-  if (c) { c.textContent = m.hidden ? randomDots() : formatCurrency(m.profit); c.style.color = !m.hidden && m.profit < 0 ? "#dc2626" : ""; }
+  if (c) { c.textContent = moneyHidden ? randomDots() : formatCurrency(m.profit); c.style.color = !moneyHidden && m.profit < 0 ? "#dc2626" : ""; }
   const note = document.getElementById("moneyProfitNote");
-  if (note) note.textContent = m.hidden ? "Ingresos − inversión − gastos" : `Ingresos − inversión − gastos (${formatCurrency(m.costs)} cargados)`;
-  ["eyeBtn1", "eyeBtn2", "eyeBtn3"].forEach((id) => { const el = document.getElementById(id); if (el) el.innerHTML = m.hidden ? EYE_OFF : EYE_OPEN; });
+  if (note) note.textContent = moneyHidden ? "Ingresos − inversión − gastos" : `Ingresos − inversión − gastos (${formatCurrency(m.costs)} cargados)`;
+  ["eyeBtn1", "eyeBtn2", "eyeBtn3"].forEach((id) => { const el = document.getElementById(id); if (el) el.innerHTML = moneyHidden ? EYE_OFF : EYE_OPEN; });
 }
 function toggleMoney() {
-  if (!window.__money) return;
-  window.__money.hidden = !window.__money.hidden;
+  moneyHidden = !moneyHidden;
   applyMoneyVisibility();
+  if (document.getElementById("clientsMoneyHead")) renderClientesTable(window.__clientFilter || "todos", document.getElementById("clientSearch")?.value || "");
   if (document.getElementById("rankModalBox")) renderRanking();
 }
 
@@ -678,7 +683,7 @@ function computeRanking() {
 function renderRanking() {
   const root = document.getElementById("rankModalRoot");
   if (!root) return;
-  const hidden = window.__money && window.__money.hidden;
+  const hidden = moneyHidden;
   const sel = window.__rankServices;
   const { rows, sum } = computeRanking();
   const max = rows.length ? rows[0].amount : 0;
@@ -772,12 +777,12 @@ function renderClientesTable(filter, search) {
     <div class="card" style="padding:0;overflow:hidden;">
       ${rows.length === 0 ? '<p style="padding:20px;color:rgba(7,10,15,.5);">No hay clientes para mostrar.</p>' : `
       <table>
-        <thead><tr><th>Cliente</th><th>Trabajando desde</th><th>Total gastado</th><th>Estado</th><th></th></tr></thead>
+        <thead><tr><th>Cliente</th><th>Trabajando desde</th><th>Total gastado<button class="eye-btn eye-inline" id="clientsMoneyHead" onclick="toggleMoney()" title="Mostrar / ocultar montos">${moneyHidden ? EYE_OFF : EYE_OPEN}</button></th><th>Estado</th><th></th></tr></thead>
         <tbody>
           ${rows.map((c) => `<tr>
             <td style="font-weight:600;"><span class="dot dot-${c.alert.level}" title="${escapeHtml(c.alert.label)}"></span>${escapeHtml(c.name)}</td>
             <td>${formatMonthsLabel(c.months)}</td>
-            <td>${formatCurrency(c.total)}</td>
+            <td>${moneyHidden ? randomDots() : formatCurrency(c.total)}</td>
             <td><span class="badge badge-${c.status}">${statusLabel(c.status)}</span></td>
             <td style="text-align:right;"><a href="#/clientes/${c.id}" style="color:var(--turquesa);font-weight:700;text-decoration:none;">Ver ficha →</a></td>
           </tr>`).join("")}
