@@ -11,6 +11,7 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
   :root{
     --turquesa:#2BBAD9; --arena:#BB9D82; --negro:#070A0F; --blanco:#fff; --bg:#f5f6f8;
@@ -125,6 +126,7 @@ const ALLOWED_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "csv", "txt", "rtf", "
 const ATTACH_ACCEPT = ALLOWED_EXT.map((e) => "." + e).join(",");
 const MAX_FILE_MB = 10;
 const BUCKET = "payment-files";
+const CAMPAIGN_BUCKET = "campaign-files";
 const INACTIVE_AFTER_DAYS = 61; // 2 meses sin pagos -> inactivo
 const PALETTE = ["#2BBAD9", "#BB9D82", "#070A0F", "#5DD3EA", "#8E7360", "#9CA3AF"];
 
@@ -464,7 +466,9 @@ function navHtml(active) {
       <div class="nav-links">
         <a class="nav-link ${active === "dashboard" ? "active" : ""}" href="#/">Panel general</a>
         <a class="nav-link ${active === "clientes" ? "active" : ""}" href="#/clientes">Clientes</a>
+        <a class="nav-link ${active === "campanas" ? "active" : ""}" href="#/campanas">Campañas</a>
         <a class="nav-btn-white" href="#/clientes/nuevo">+ Cliente</a>
+        <a class="nav-link ${active === "configuracion" ? "active" : ""}" href="#/configuracion" title="Configuración">⚙ Configuración</a>
         <button class="nav-logout" onclick="logout()">Salir</button>
       </div>
     </div>
@@ -497,6 +501,10 @@ async function render() {
     await viewReporte(parts[1]);
   } else if (parts[0] === "clientes" && parts.length === 2) {
     await viewClienteDetalle(parts[1]);
+  } else if (parts[0] === "campanas" && parts.length <= 1) {
+    await viewCampanas();
+  } else if (parts[0] === "configuracion" && parts.length <= 1) {
+    await viewConfiguracion();
   } else {
     app.innerHTML = navHtml("") + '<main><p>Página no encontrada.</p></main>';
   }
@@ -1190,6 +1198,174 @@ async function handleUploadReport(e) {
     btn.disabled = false; btn.textContent = "Cargar y analizar";
   }
   return false;
+}
+
+
+// -------------------- CAMPAÑAS --------------------
+const CREATIVE_TYPES = ["Imagen estática", "Carrusel", "Reel", "Historia", "Video", "UGC / testimonio", "Anuncio catálogo", "Otro"];
+const CAMPAIGN_EXT = ["pdf","doc","docx","xls","xlsx","csv","txt","rtf","odt","ods","ppt","pptx","jpg","jpeg","png","webp"];
+function campaignCreativeRows() {
+  const wrap = document.getElementById("creativeRows");
+  const rows = [...wrap.querySelectorAll(".creative-row")];
+  return rows.map(r => ({ type:r.querySelector("[data-type]").value, quantity:Math.max(0,Number(r.querySelector("[data-qty]").value||0)) }))
+    .filter(r => r.quantity > 0);
+}
+function addCreativeRow(type="", quantity=1) {
+  const wrap=document.getElementById("creativeRows");
+  const row=document.createElement("div"); row.className="creative-row";
+  row.style.cssText="display:grid;grid-template-columns:minmax(180px,1fr) 100px auto;gap:8px;margin:8px 0;";
+  row.innerHTML=`<select data-type style="width:100%">${CREATIVE_TYPES.map(t=>`<option ${t===type?"selected":""}>${t}</option>`).join("")}</select><input data-qty type="number" min="0" value="${quantity}" aria-label="Cantidad" style="width:100%"><button type="button" class="btn btn-sm" style="background:#fee2e2;color:#991b1b" onclick="this.parentElement.remove()">Quitar</button>`;
+  wrap.appendChild(row);
+}
+async function viewCampanas() {
+  loadingShell("campanas");
+  const [{data:clients,error:ce},{data:campaigns,error:ca}] = await Promise.all([
+    sb.from("clients").select("id,name").order("name"),
+    sb.from("campaigns").select("*").order("period_month",{ascending:false})
+  ]);
+  if (ce || ca) {
+    app.innerHTML=`${navHtml("campanas")}<main><h1 class="page-title">Registro de campañas</h1><div class="card">No se pudieron cargar las campañas. Ejecutá primero el SQL de migración incluido con esta versión.<p style="font-size:12px">${escapeHtml(ca?.message||ce?.message||"")}</p></div></main>`; return;
+  }
+  const cls=clients||[], rows=campaigns||[];
+  app.innerHTML=`${navHtml("campanas")}<main>
+    <h1 class="page-title">Registro de campañas</h1>
+    <p style="color:rgba(7,10,15,.6);margin-top:-12px">Guardá objetivo, piezas creativas, cantidades y archivos con resultados de Meta para cada cliente.</p>
+    <div class="card"><h3 style="font-family:'Sora';margin-top:0">Nueva campaña / registro mensual</h3>
+      <form onsubmit="return saveCampaign(event)">
+        <div class="grid grid-2">
+          <div><label class="field-label">Cliente *</label><select id="campClient" required style="width:100%"><option value="">Elegir cliente</option>${cls.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></div>
+          <div><label class="field-label">Nombre de campaña / conjunto *</label><input id="campName" required placeholder="Ej. Campaña mensajes — primavera" style="width:100%"></div>
+          <div><label class="field-label">Mes de referencia *</label><input id="campMonth" type="month" required value="${localMonthStr()}" style="width:100%"></div>
+          <div><label class="field-label">Objetivo principal *</label><select id="campObjective" required style="width:100%"><option value="">Elegir objetivo</option>${["Reconocimiento","Tráfico","Interacción","Mensajes","Clientes potenciales","Ventas","Visitas al perfil","Conversiones","Otro"].map(x=>`<option>${x}</option>`).join("")}</select></div>
+        </div>
+        <label class="field-label" style="margin-top:14px">Creativos producidos (tipo y cantidad)</label>
+        <div id="creativeRows"></div><button type="button" class="btn btn-sm" style="background:rgba(7,10,15,.06)" onclick="addCreativeRow()">+ Agregar tipo de creativo</button>
+        <div style="margin-top:14px"><label class="field-label">Notas / hipótesis / público / inversión (opcional)</label><textarea id="campNotes" rows="3" style="width:100%" placeholder="Qué se buscaba probar, público, fechas, presupuesto..."></textarea></div>
+        <div style="margin-top:12px"><label class="field-label">Informe de resultados de Meta (PDF, Excel, Word, PowerPoint, CSV o imágenes; varios archivos)</label><input id="campFiles" type="file" multiple accept="${CAMPAIGN_EXT.map(x=>"."+x).join(",")}" style="width:100%"><p style="font-size:12px;color:rgba(7,10,15,.5)">Se guardan los archivos originales como respaldo de KPIs. El análisis automático de estos adjuntos no modifica el informe mensual de evolución.</p></div>
+        <p id="campMsg" style="font-size:13px;color:#b91c1c"></p><button id="campSaveBtn" class="btn btn-primary">Guardar campaña</button>
+      </form>
+    </div>
+    <h2 style="font-family:'Sora';font-size:18px">Historial</h2>
+    ${rows.length?rows.map(c=>{const client=cls.find(x=>x.id===c.client_id);const creatives=Array.isArray(c.creatives)?c.creatives:[];const atts=Array.isArray(c.attachments)?c.attachments:[];return `<div class="card">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><span class="badge badge-activo">${monthKeyLabel(c.period_month)}</span><h3 style="margin:8px 0 2px;font-family:'Sora'">${escapeHtml(c.name)}</h3><p style="margin:0;color:rgba(7,10,15,.6);font-size:13px">${escapeHtml(client?.name||"Cliente eliminado")} · Objetivo: <b>${escapeHtml(c.objective||"—")}</b></p></div><button class="btn btn-sm" style="background:#fee2e2;color:#991b1b;align-self:flex-start" onclick="deleteCampaign('${c.id}')">Eliminar</button></div>
+      <div style="margin-top:10px">${creatives.map(x=>`<span class="chip">${escapeHtml(x.type)}: <b>${Number(x.quantity)||0}</b></span>`).join("")||"Sin creativos cargados"}</div>
+      ${c.notes?`<p style="white-space:pre-wrap;font-size:14px;color:rgba(7,10,15,.7)">${escapeHtml(c.notes)}</p>`:""}
+      ${atts.length?`<div style="margin-top:10px"><b style="font-size:13px">Archivos adjuntos</b><div>${atts.map((a,i)=>`<a href="#" class="chip" onclick="openCampaignAttachment('${c.id}',${i});return false;" style="text-decoration:none">${fileIcon(a.name)} ${escapeHtml(a.name)}</a>`).join("")}</div></div>`:"<p style='font-size:12px;color:rgba(7,10,15,.45)'>Sin archivos adjuntos.</p>"}
+    </div>`}).join(""):'<div class="card">Todavía no hay campañas registradas.</div>'}
+  </main>`;
+  addCreativeRow("Imagen estática",1);
+}
+async function saveCampaign(e) {
+  e.preventDefault();
+  const msg=document.getElementById("campMsg"), btn=document.getElementById("campSaveBtn");
+  const client_id=document.getElementById("campClient").value;
+  const name=document.getElementById("campName").value.trim();
+  const month=document.getElementById("campMonth").value;
+  const objective=document.getElementById("campObjective").value;
+  const creatives=campaignCreativeRows();
+  const notes=document.getElementById("campNotes").value.trim();
+  const files=[...document.getElementById("campFiles").files];
+  if(!creatives.length){msg.textContent="Agregá al menos un tipo de creativo con cantidad mayor a cero.";return false;}
+  btn.disabled=true;btn.textContent="Guardando...";
+  try {
+    const {data,error}=await sb.from("campaigns").insert({client_id,name,period_month:`${month}-01`,objective,creatives,notes:notes||null,attachments:[]}).select().single();
+    if(error) throw error;
+    const attachments=[], failed=[];
+    for(let i=0;i<files.length;i++){
+      const f=files[i],ext=f.name.split(".").pop().toLowerCase();
+      if(!CAMPAIGN_EXT.includes(ext)){failed.push(`${f.name}: formato no permitido`);continue;}
+      if(f.size>20*1024*1024){failed.push(`${f.name}: supera 20 MB`);continue;}
+      const path=`${client_id}/${data.id}/${Date.now()}-${i}-${safeFileName(f.name)}`;
+      const up=await sb.storage.from(CAMPAIGN_BUCKET).upload(path,f,{contentType:f.type||undefined,upsert:false});
+      if(up.error){failed.push(`${f.name}: ${up.error.message}`);continue;}
+      attachments.push({path,name:f.name,size:f.size,type:f.type||ext});
+    }
+    const upd=await sb.from("campaigns").update({attachments}).eq("id",data.id);
+    if(upd.error) throw upd.error;
+    if(failed.length) alert("La campaña se guardó, pero algunos archivos no se pudieron subir:\\n"+failed.join("\\n"));
+    await viewCampanas();
+  } catch(err){msg.textContent=`No se pudo guardar: ${err.message||err}`;btn.disabled=false;btn.textContent="Guardar campaña";}
+  return false;
+}
+async function openCampaignAttachment(id,idx){
+  const {data,error}=await sb.from("campaigns").select("attachments").eq("id",id).single();
+  const a=(data?.attachments||[])[idx];if(error||!a)return;
+  const w=window.open("","_blank");
+  const signed=await sb.storage.from(CAMPAIGN_BUCKET).createSignedUrl(a.path,300);
+  if(signed.error||!signed.data){if(w)w.close();alert("No se pudo abrir el archivo: "+(signed.error?.message||""));return;}
+  if(w)w.location.href=signed.data.signedUrl;else location.href=signed.data.signedUrl;
+}
+async function deleteCampaign(id){
+  if(!confirm("¿Eliminar este registro de campaña? Los archivos vinculados también se intentarán eliminar."))return;
+  const {data}=await sb.from("campaigns").select("attachments").eq("id",id).single();
+  const paths=(data?.attachments||[]).map(a=>a.path).filter(Boolean);
+  if(paths.length)await sb.storage.from(CAMPAIGN_BUCKET).remove(paths);
+  const {error}=await sb.from("campaigns").delete().eq("id",id);
+  if(error){alert("No se pudo eliminar: "+error.message);return;} await viewCampanas();
+}
+
+// -------------------- CONFIGURACIÓN Y COPIA DE SEGURIDAD --------------------
+async function viewConfiguracion(){
+  loadingShell("configuracion");
+  app.innerHTML=`${navHtml("configuracion")}<main>
+    <h1 class="page-title">Configuración</h1>
+    <div class="card"><h3 style="font-family:'Sora';margin-top:0">Cuenta</h3><p style="font-size:13px;color:rgba(7,10,15,.6)">Sesión: ${escapeHtml(session?.user?.email||"usuario autenticado")}</p>
+      <form onsubmit="return changePassword(event)" style="max-width:440px"><label class="field-label">Nueva contraseña</label><input id="newPassword" type="password" minlength="8" autocomplete="new-password" required style="width:100%;margin-bottom:10px" placeholder="Mínimo 8 caracteres"><label class="field-label">Repetir contraseña</label><input id="newPassword2" type="password" minlength="8" required style="width:100%;margin-bottom:10px"><button class="btn btn-primary">Cambiar contraseña</button><p id="passwordMsg" style="font-size:13px"></p></form>
+    </div>
+    <div class="card"><h3 style="font-family:'Sora';margin-top:0">Respaldo completo</h3><p style="font-size:14px;color:rgba(7,10,15,.65)">Exportá registros y archivos vinculados a pagos y campañas en un ZIP. Para migrar, importá un ZIP generado por esta herramienta. Guardalo fuera de la computadora también.</p>
+      <button class="btn btn-primary" id="backupBtn" onclick="exportFullBackup()">⬇ Exportar toda la información</button>
+      <div style="height:14px"></div><label class="field-label">Importar respaldo ZIP de Muta</label><input id="backupFile" type="file" accept=".zip" style="width:100%;margin-bottom:10px"><button class="btn btn-dark" onclick="importFullBackup()">Importar respaldo</button>
+      <p id="backupMsg" style="font-size:13px;color:rgba(7,10,15,.65)"></p><p style="font-size:12px;color:#9a3412">Importar mezcla registros por ID y puede sobrescribir datos con el mismo ID. Hacé un respaldo antes. No importa usuarios ni contraseñas; se administran en Supabase Auth.</p>
+    </div>
+    <div class="card"><h3 style="font-family:'Sora';margin-top:0">Notas de seguridad</h3><ul style="font-size:13px;line-height:1.7;color:rgba(7,10,15,.65)"><li>El respaldo contiene datos de clientes, pagos, informes, campañas y archivos; tratá el ZIP como información confidencial.</li><li>La importación necesita que exista el esquema SQL y los buckets de almacenamiento.</li><li>Para mover la app a otro proyecto, además del ZIP hay que configurar las credenciales de Supabase y volver a ejecutar el SQL de migración.</li></ul></div>
+  </main>`;
+}
+async function changePassword(e){
+  e.preventDefault();const a=document.getElementById("newPassword").value,b=document.getElementById("newPassword2").value,msg=document.getElementById("passwordMsg");
+  if(a!==b){msg.style.color="#b91c1c";msg.textContent="Las contraseñas no coinciden.";return false;}
+  const {error}=await sb.auth.updateUser({password:a});
+  msg.style.color=error?"#b91c1c":"#047857";msg.textContent=error?`No se pudo cambiar: ${error.message}`:"Contraseña actualizada correctamente.";if(!error)e.target.reset();return false;
+}
+async function exportFullBackup(){
+  const btn=document.getElementById("backupBtn"),msg=document.getElementById("backupMsg");
+  btn.disabled=true;btn.textContent="Preparando ZIP...";
+  try{
+    const zip=new JSZip(), tables=["clients","payments","reports","monthly_finance","campaigns"], backup={format:"muta-backup",version:1,created_at:new Date().toISOString(),tables:{}};
+    for(const t of tables){const {data,error}=await sb.from(t).select("*");if(error)throw new Error(`${t}: ${error.message}`);backup.tables[t]=data||[];}
+    zip.file("muta-backup.json",JSON.stringify(backup,null,2));
+    const filesFolder=zip.folder("files");let n=0,errors=[];
+    const refs=[];
+    for(const p of backup.tables.payments)for(const a of (Array.isArray(p.attachments)?p.attachments:[]))if(a.path)refs.push({bucket:BUCKET,path:a.path,name:a.name});
+    for(const c of backup.tables.campaigns)for(const a of (Array.isArray(c.attachments)?c.attachments:[]))if(a.path)refs.push({bucket:CAMPAIGN_BUCKET,path:a.path,name:a.name});
+    for(const r of refs){
+      const {data,error}=await sb.storage.from(r.bucket).download(r.path);
+      if(error){errors.push(`${r.name}: ${error.message}`);continue;}
+      const bytes=await data.arrayBuffer();filesFolder.file(`${r.bucket}/${r.path}`,bytes);n++;
+    }
+    if(errors.length)backup.file_warnings=errors;
+    zip.file("muta-backup.json",JSON.stringify(backup,null,2));
+    const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
+    const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`muta-respaldo-${localDateStr()}.zip`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    msg.textContent=`Respaldo generado: ${backup.tables.clients.length} clientes y ${n}/${refs.length} archivos. ${errors.length?`No se pudieron incluir ${errors.length} archivos; revisá el detalle en el JSON.`:"Archivos incluidos correctamente."}`;
+  }catch(err){msg.textContent=`Error al exportar: ${err.message||err}`;}
+  btn.disabled=false;btn.textContent="⬇ Exportar toda la información";
+}
+async function importFullBackup(){
+  const input=document.getElementById("backupFile"),msg=document.getElementById("backupMsg"),file=input.files[0];
+  if(!file){msg.textContent="Seleccioná un archivo ZIP.";return;}
+  if(!confirm("Esto insertará o actualizará registros y puede sobrescribir información existente. ¿Hiciste un respaldo previo y querés continuar?"))return;
+  msg.textContent="Leyendo respaldo...";
+  try{
+    const zip=await JSZip.loadAsync(file),entry=zip.file("muta-backup.json");if(!entry)throw new Error("El ZIP no contiene muta-backup.json.");
+    const backup=JSON.parse(await entry.async("text"));if(backup.format!=="muta-backup"||!backup.tables)throw new Error("El archivo no parece ser un respaldo válido de Muta.");
+    const order=["clients","payments","reports","monthly_finance","campaigns"];
+    for(const t of order){const rows=backup.tables[t]||[];for(let i=0;i<rows.length;i+=100){const {error}=await sb.from(t).upsert(rows.slice(i,i+100));if(error)throw new Error(`${t}: ${error.message}`);}}
+    const stored=[];
+    for(const t of ["payments","campaigns"])for(const row of (backup.tables[t]||[]))for(const a of (Array.isArray(row.attachments)?row.attachments:[]))if(a.path)stored.push({bucket:t==="payments"?BUCKET:CAMPAIGN_BUCKET,path:a.path});
+    let restored=0,failed=[];
+    for(const f of stored){const z=zip.file(`files/${f.bucket}/${f.path}`);if(!z){failed.push(f.path+" (no está en el ZIP)");continue;}const blob=await z.async("blob");const {error}=await sb.storage.from(f.bucket).upload(f.path,blob,{upsert:true});if(error)failed.push(f.path+" ("+error.message+")");else restored++;}
+    msg.textContent=`Importación terminada. Archivos restaurados: ${restored}/${stored.length}.${failed.length?" Errores: "+failed.length+". Revisá permisos/buckets y el respaldo.":""}`;
+  }catch(err){msg.textContent=`No se pudo importar: ${err.message||err}`;}
 }
 
 // -------------------- 14. VISTA: EXPORTAR INFORME --------------------
